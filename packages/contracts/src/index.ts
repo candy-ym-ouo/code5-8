@@ -164,6 +164,97 @@ export interface SeasonReview {
   changes: string[];
 }
 
+/** 可追溯证据引用：每条结论都必须能回溯到具体的存档记录。 */
+export interface ReviewEvidence {
+  kind: 'sample' | 'observation' | 'restoration' | 'species_state' | 'environment';
+  refId: string;
+  year: number;
+  season?: Season;
+  day?: number;
+  siteId?: SiteId;
+  speciesId?: string;
+  detail: string;
+}
+
+/** 带证据链的结论文案，evidence 为空时不允许展示为确定性结论。 */
+export interface TraceableClaim {
+  id: string;
+  conclusion: string;
+  evidence: ReviewEvidence[];
+  confidence: 'high' | 'medium' | 'low';
+}
+
+/** 分布迁移：实际扩散事件必须给出迁出地、迁入地与迁移个体数。 */
+export interface DistributionMigration {
+  speciesId: string;
+  speciesName: string;
+  fromSiteId: SiteId;
+  fromSiteName: string;
+  toSiteId: SiteId;
+  toSiteName: string;
+  migrants: number;
+  startPopulation: number;
+  endPopulation: number;
+  statusBefore: string;
+  statusAfter: string;
+  driver: 'dispersal' | 'local_change' | 'local_extinction' | 'colonization';
+  claim: TraceableClaim;
+}
+
+/** 物候偏移：以年初基线与年末状态的 shift 差值为准，绑定该物种的观察证据。 */
+export interface PhenologyShift {
+  speciesId: string;
+  speciesName: string;
+  siteId: SiteId;
+  siteName: string;
+  season: Season;
+  baselineStartDay: number;
+  baselinePeakDay: number;
+  baselineEndDay: number;
+  observedStartDay: number;
+  observedPeakDay: number;
+  observedEndDay: number;
+  shiftDays: number;
+  observationCount: number;
+  claim: TraceableClaim;
+}
+
+/** 修复成效：按修复动作归因，给出动作次数与可观测的状态变化。 */
+export interface RestorationOutcome {
+  action: string;
+  actionLabel: string;
+  siteId: SiteId;
+  siteName: string;
+  speciesId: string | null;
+  speciesName: string | null;
+  count: number;
+  disturbanceBefore: number;
+  disturbanceAfter: number;
+  healthBefore: number | null;
+  healthAfter: number | null;
+  seedBankBefore: number | null;
+  seedBankAfter: number | null;
+  claim: TraceableClaim;
+}
+
+/** 采集误差：错误采集必须逐条对应样本记录及其生态影响。 */
+export interface SamplingError {
+  sampleId: string;
+  speciesId: string;
+  speciesName: string;
+  siteId: SiteId;
+  siteName: string;
+  season: Season;
+  day: number;
+  method: SampleMethod;
+  methodLabel: string;
+  healthDelta: number;
+  populationDelta: number;
+  seedBankDelta: number;
+  disturbanceDelta: number;
+  claim: TraceableClaim;
+}
+
 export interface AnnualReview {
   year: number;
   headline: string;
@@ -179,7 +270,34 @@ export interface AnnualReview {
   incorrectSamples: number;
   recommendations: string[];
   restorationUnlocked: boolean;
+  /** 分布迁移（实际扩散 + 等级变化），每条结论带证据链。 */
+  distributionMigrations: DistributionMigration[];
+  /** 物候偏移，按物种 × 区域汇总，缺观察证据时降级为低置信度。 */
+  phenologyShifts: PhenologyShift[];
+  /** 本年度已执行修复动作的成效归因；未解锁时为空数组。 */
+  restorationOutcomes: RestorationOutcome[];
+  /** 采集误差台账，逐条可追溯到 samples 表。 */
+  samplingErrors: SamplingError[];
+  /** 数据完备性与采集偏差说明，避免把观察偏差当成生态结论。 */
+  dataQuality: {
+    observationCount: number;
+    sampleCount: number;
+    incorrectSampleCount: number;
+    restorationCount: number;
+    siteCoverage: Array<{ siteId: SiteId; siteName: string; observations: number; samples: number }>;
+    caveats: string[];
+  };
+  /** live=年度结算生成；backfilled=仅依据历史证据补算，不影响任何后续状态。 */
+  provenance: 'live' | 'backfilled';
+  generatedAt: string;
 }
+
+export interface BackfillAnnualReportResult {
+  year: number;
+  provenance: 'backfilled';
+  report: AnnualReview;
+}
+
 
 export interface WorldSnapshot {
   saveId: string;

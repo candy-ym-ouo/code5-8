@@ -290,6 +290,7 @@ input[type="color"] { width: 46px; min-height: 38px; padding: .15rem; }
 .review-panel { padding: clamp(1.4rem, 4vw, 3rem); background: linear-gradient(145deg, #fffdf5, var(--season-soft)); }
 .review-panel h2 { max-width: 900px; font-size: clamp(1.8rem, 4vw, 3.3rem); }
 .review-lead { color: var(--muted); font-size: 1.05rem; }
+.review-traceability { margin-top: .3rem; font-size: .8rem; color: var(--moss); letter-spacing: .02em; }
 .review-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: .7rem; margin: 1.4rem 0; }
 .metric { padding: 1rem; border: 1px solid var(--line); border-radius: 3px; background: rgba(255, 255, 255, .59); }
 .metric span, .metric strong { display: block; }
@@ -323,6 +324,28 @@ input[type="color"] { width: 46px; min-height: 38px; padding: .15rem; }
 .bar-negative { background: #b04e43; }
 .insight-list, .recommendation-list { margin: 0; padding-left: 1.2rem; line-height: 1.85; }
 .two-document-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+
+/* Traceable annual report */
+.provenance-badge { display: inline-block; margin-left: .8rem; padding: .15rem .55rem; border: 1px solid rgba(255,255,255,.55); border-radius: 99px; font-size: .72rem; letter-spacing: .08em; }
+.trace-list { display: grid; gap: .8rem; }
+.trace-card { padding: 1rem 1.1rem; border: 1px solid var(--line); border-left: 4px solid var(--moss); background: var(--paper); }
+.trace-card p { margin: .45rem 0 .55rem; }
+.trace-card-head { display: flex; flex-wrap: wrap; gap: .5rem; }
+.confidence, .trace-tag { display: inline-block; padding: .12rem .55rem; border-radius: 99px; font-size: .68rem; letter-spacing: .05em; border: 1px solid var(--line); color: var(--muted); background: rgba(255,255,255,.6); }
+.confidence-high { color: #1f5b3b; border-color: #9cc4ac; background: #e8f2ec; }
+.confidence-medium { color: #7a5a1e; border-color: #d8c08a; background: #f7efd9; }
+.confidence-low { color: #8a3c32; border-color: #d6a89f; background: #f6e6e2; }
+.evidence-list { margin: .45rem 0 0; padding-left: 1.1rem; font-size: .82rem; line-height: 1.7; color: #42544a; }
+.evidence-kind { display: inline-block; margin-right: .4rem; padding: 0 .4rem; border-radius: 3px; background: rgba(49,95,69,.1); color: var(--moss); font-weight: 700; font-size: .72rem; }
+.evidence-compact { padding-left: 0; list-style: none; }
+.trace-table-wrap { overflow-x: auto; }
+.trace-table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+.trace-table th, .trace-table td { padding: .5rem .55rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.trace-table th { color: var(--muted); font-size: .72rem; letter-spacing: .05em; }
+.coverage-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: .65rem; margin: .8rem 0 1rem; }
+.coverage-cell { display: grid; gap: .25rem; padding: .75rem; border: 1px solid var(--line); background: rgba(255,255,255,.6); }
+.coverage-cell span { color: var(--muted); font-size: .75rem; }
+.report-meta { margin-top: .9rem; color: var(--muted); font-size: .75rem; }
 
 /* Journal and dossier */
 .document-page { max-width: 1400px; margin: 0 auto; }
@@ -393,6 +416,7 @@ input[type="color"] { width: 46px; min-height: 38px; padding: .15rem; }
   .mobile-nav a.active { color: #fff; background: var(--moss-deep); }
   .field-heading { display: grid; }
   .map-and-weather, .species-workspace, .field-tools, .restoration-card, .two-document-columns, .report-overview, .dossier-hero, .settings-grid { grid-template-columns: 1fr; }
+  .coverage-grid { grid-template-columns: 1fr 1fr; }
   .species-visual { min-height: 360px; border-right: 0; border-bottom: 1px solid var(--line); }
   .map-stop { min-width: 90px; padding: .5rem; font-size: .74rem; }
   .review-stats { grid-template-columns: 1fr 1fr; }

@@ -40,6 +40,9 @@ export function ReviewPanel({
         <p className="eyebrow">ANNUAL REPORT · YEAR {report.year}</p>
         <h2>{report.headline}</h2>
         <p className="review-lead">全图种群变化 {formatPercent(report.populationChangePercent)}，错误采集 {report.incorrectSamples} 次。</p>
+        <p className="review-traceability">
+          可追溯结论：分布迁移 {report.distributionMigrations.length} 条 · 物候偏移 {report.phenologyShifts.length} 条 · 修复成效 {report.restorationOutcomes.length} 条 · 采集误差 {report.samplingErrors.length} 条
+        </p>
         <div className="report-mini-grid">
           {report.speciesChanges.slice(0, 6).map((change) => (
             <article key={change.speciesId}>

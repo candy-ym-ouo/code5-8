@@ -633,7 +633,20 @@ const SITE_NEIGHBORS: Record<SiteId, SiteId[]> = {
   ridge: ['foothill', 'mixed_forest', 'stream_valley']
 };
 
-export function disperseSpecies(states: SpeciesState[], sites: SiteState[]): SpeciesState[] {
+export interface DispersalEvent {
+  speciesId: string;
+  fromSiteId: SiteId;
+  toSiteId: SiteId;
+  migrants: number;
+  sourcePopulationAfter: number;
+  targetPopulationAfter: number;
+}
+
+export function disperseSpecies(
+  states: SpeciesState[],
+  sites: SiteState[],
+  onEvent?: (event: DispersalEvent) => void
+): SpeciesState[] {
   const siteMap = new Map(sites.map((site) => [site.siteId, site]));
   const bySpecies = new Map<string, Map<SiteId, SpeciesState>>();
 
@@ -683,6 +696,14 @@ export function disperseSpecies(states: SpeciesState[], sites: SiteState[]): Spe
         targetState.population = round(targetState.population + migrants, 2);
         targetState.status = getStatus(targetState.population, neighborProfile.carryingCapacity, targetState.health);
         targetState.suitability = round(suitability, 3);
+        onEvent?.({
+          speciesId,
+          fromSiteId: sourceSiteId,
+          toSiteId: neighborId,
+          migrants: round(migrants, 2),
+          sourcePopulationAfter: source.population,
+          targetPopulationAfter: targetState.population
+        });
       }
     }
   }

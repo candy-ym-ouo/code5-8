@@ -109,6 +109,22 @@ describe('closed-loop API', () => {
     expect(world.annualReview?.populationChangePercent).not.toBe(100);
     expect(world.annualReview?.speciesChanges.every((item) => Number.isFinite(item.populationChangePercent))).toBe(true);
     expect(world.annualReview?.speciesChanges.every((item) => Number.isFinite(item.healthChange))).toBe(true);
+    expect(world.annualReview?.provenance).toBe('live');
+    // 错误采集必须逐条可追溯，且数值与样本影响一致。
+    expect(world.annualReview?.samplingErrors.length).toBe(world.annualReview?.incorrectSamples);
+    for (const error of world.annualReview?.samplingErrors ?? []) {
+      expect(error.claim.evidence.length).toBeGreaterThan(0);
+      expect(error.claim.evidence.every((item) => item.refId.length > 0)).toBe(true);
+      expect(error.healthDelta).toBeLessThan(0);
+      expect(error.disturbanceDelta).toBeGreaterThan(0);
+    }
+    expect(world.annualReview?.dataQuality.siteCoverage).toHaveLength(4);
+    expect(world.annualReview?.dataQuality.observationCount).toBeGreaterThan(0);
+    // 每个物候偏移结论都要绑定证据与置信度。
+    for (const shift of world.annualReview?.phenologyShifts ?? []) {
+      expect(shift.claim.evidence.length).toBeGreaterThan(0);
+      expect(['high', 'medium', 'low']).toContain(shift.claim.confidence);
+    }
 
     world = await command(agent, world, { type: 'BEGIN_NEXT_YEAR' });
     expect(world.year).toBe(2);
@@ -122,8 +138,50 @@ describe('closed-loop API', () => {
       .prepare('SELECT COUNT(*) AS count FROM environment_history WHERE save_id = ?')
       .get(world.saveId) as unknown as { count: number };
     expect(Number(historyCount.count)).toBeGreaterThan(0);
+
+    // 年初基线与扩散台账必须落库，供历史补算使用。
+    const baselineCountRow = store.db
+      .prepare('SELECT COUNT(*) AS count FROM annual_baselines WHERE save_id = ?')
+      .get(world.saveId) as unknown as { count: number };
+    expect(Number(baselineCountRow.count)).toBe(2);
+
+    // 历史年份补算：只写 backfilled_annual_reports，不触碰任何状态表与正式报告。
+    const liveReportBefore = (store.db
+      .prepare('SELECT report_json FROM annual_reports WHERE save_id = ? AND year = 1')
+      .get(world.saveId) as unknown as { report_json: string }).report_json;
+    const revisionBefore = world.revision;
+    const phaseBefore = world.phase;
+    const backfilled = await agent.post(`/api/save/${world.saveId}/report/1/backfill`).expect(201);
+    expect(backfilled.body.provenance).toBe('backfilled');
+    expect(backfilled.body.report.provenance).toBe('backfilled');
+    expect(backfilled.body.report.year).toBe(1);
+    expect(backfilled.body.report.dataQuality.caveats.some((text: string) => text.includes('补算'))).toBe(true);
+    expect(backfilled.body.report.samplingErrors.length).toBeGreaterThan(0);
+
+    const worldAfterBackfill = await agent.get(`/api/save/${world.saveId}/world`).expect(200);
+    expect(worldAfterBackfill.body.revision).toBe(revisionBefore);
+    expect(worldAfterBackfill.body.phase).toBe(phaseBefore);
+    expect(worldAfterBackfill.body.year).toBe(2);
+    const liveReportAfter = (store.db
+      .prepare('SELECT report_json FROM annual_reports WHERE save_id = ? AND year = 1')
+      .get(world.saveId) as unknown as { report_json: string }).report_json;
+    expect(liveReportAfter).toBe(liveReportBefore);
+    expect(store.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+
+    // 正式报告优先于补算报告返回。
     const report = await agent.get(`/api/save/${world.saveId}/report/1`).expect(200);
-    expect(report.body.year).toBe(1);
+    expect(report.body.provenance).toBe('live');
+
+    // 不允许补算当前年份或未来年份。
+    await agent.post(`/api/save/${world.saveId}/report/2/backfill`).expect(409);
+    await agent.post(`/api/save/${world.saveId}/report/9/backfill`).expect(409);
+
+    // 补算可重复执行（覆盖补算表），仍不影响正式表。
+    await agent.post(`/api/save/${world.saveId}/report/1/backfill`).expect(201);
+    const backfillRows = store.db
+      .prepare('SELECT COUNT(*) AS count FROM backfilled_annual_reports WHERE save_id = ? AND year = 1')
+      .get(world.saveId) as unknown as { count: number };
+    expect(Number(backfillRows.count)).toBe(1);
 
     const firstExport = await agent.post(`/api/save/${world.saveId}/export`).expect(200);
     expect(firstExport.body.token).toHaveLength(43);
@@ -134,6 +192,72 @@ describe('closed-loop API', () => {
     expect(imported.body.year).toBe(2);
     expect(store.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
   }, 30_000);
+
+  it('traces restoration outcomes and keeps backfilled history isolated from live year two', async () => {
+    const secondAgent = request.agent(app);
+    const createResponse = await secondAgent.post('/api/save').expect(201);
+    let world = createResponse.body as WorldSnapshot;
+
+    // 一次错误采集保证修复在年报后解锁，同时留下采集误差证据。
+    world = await command(secondAgent, world, { type: 'TAKE_SAMPLE', speciesId: 'prunus-davidiana', method: 'litter' });
+
+    for (const season of ['spring', 'summer', 'autumn', 'winter'] as Season[]) {
+      expect(world.season).toBe(season);
+      world = await advanceToDayEight(secondAgent, world);
+      world = await command(secondAgent, world, { type: 'END_SEASON' });
+      if (season !== 'winter') {
+        world = await command(secondAgent, world, { type: 'BEGIN_NEXT_SEASON' });
+      }
+    }
+    expect(world.annualReview?.provenance).toBe('live');
+    world = await command(secondAgent, world, { type: 'BEGIN_NEXT_YEAR' });
+    expect(world.year).toBe(2);
+
+    // 第二年在山麓林缘执行一次降低干扰修复。
+    if (world.currentSiteId !== 'foothill') {
+      world = await command(secondAgent, world, { type: 'MOVE_ZONE', siteId: 'foothill' });
+    }
+    world = await command(secondAgent, world, {
+      type: 'RESTORE_HABITAT',
+      speciesId: 'prunus-davidiana',
+      action: 'reduce_disturbance'
+    });
+    const restorationRow = store.db
+      .prepare('SELECT * FROM restoration_actions WHERE save_id = ? AND year = 2')
+      .get(world.saveId) as unknown as { disturbance_before: number; disturbance_after: number };
+    expect(restorationRow).toBeTruthy();
+    expect(restorationRow.disturbance_after).toBeLessThan(restorationRow.disturbance_before);
+
+    for (const season of ['spring', 'summer', 'autumn', 'winter'] as Season[]) {
+      expect(world.season).toBe(season);
+      world = await advanceToDayEight(secondAgent, world);
+      world = await command(secondAgent, world, { type: 'END_SEASON' });
+      if (season !== 'winter') {
+        world = await command(secondAgent, world, { type: 'BEGIN_NEXT_SEASON' });
+      }
+    }
+
+    // 正式年报必须包含可追溯的修复成效。
+    expect(world.annualReview?.year).toBe(2);
+    const outcome = world.annualReview?.restorationOutcomes.find(
+      (item) => item.action === 'reduce_disturbance' && item.speciesId === 'prunus-davidiana'
+    );
+    expect(outcome).toBeTruthy();
+    expect(outcome?.count).toBe(1);
+    expect(outcome?.disturbanceAfter).toBeLessThan(outcome?.disturbanceBefore ?? 0);
+    expect(outcome?.claim.evidence.some((item) => item.kind === 'restoration')).toBe(true);
+
+    // 补算第一年：修复台账是第二年的，不得泄漏到第一年补算报告。
+    const backfilled = await secondAgent.post(`/api/save/${world.saveId}/report/1/backfill`).expect(201);
+    expect(backfilled.body.report.provenance).toBe('backfilled');
+    expect(backfilled.body.report.restorationOutcomes).toEqual([]);
+    expect(backfilled.body.report.dataQuality.restorationCount).toBe(0);
+
+    // 第二年正式报告必须仍然是 live，且不被任何补算覆盖。
+    const liveYearTwo = await secondAgent.get(`/api/save/${world.saveId}/report/2`).expect(200);
+    expect(liveYearTwo.body.provenance).toBe('live');
+    expect(liveYearTwo.body.restorationOutcomes.length).toBeGreaterThan(0);
+  }, 40_000);
 });
 
 async function command(

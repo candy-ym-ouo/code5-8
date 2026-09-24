@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS samples (
   method TEXT NOT NULL,
   protocol_match INTEGER NOT NULL,
   effects_json TEXT NOT NULL,
+  disturbance_delta REAL NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 
@@ -171,4 +172,68 @@ CREATE TABLE IF NOT EXISTS save_exports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_exports_save ON save_exports(save_id);
+
+-- 年度基线：每个自然年开始（春季第 1 日、扩散结算之后）的状态快照。
+-- 年度报告的所有同比结论都以该基线为准，保证可追溯、可复核。
+CREATE TABLE IF NOT EXISTS annual_baselines (
+  id TEXT PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  species_json TEXT NOT NULL,
+  sites_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(save_id, year)
+);
+
+-- 跨年度扩散台账：BEGIN_NEXT_YEAR 中实际发生的迁移事件，归属到目标年份。
+CREATE TABLE IF NOT EXISTS dispersal_events (
+  id TEXT PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  species_id TEXT NOT NULL,
+  from_site_id TEXT NOT NULL,
+  to_site_id TEXT NOT NULL,
+  migrants REAL NOT NULL,
+  source_population_after REAL NOT NULL,
+  target_population_after REAL NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(save_id, year, species_id, from_site_id, to_site_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispersal_save_year
+  ON dispersal_events(save_id, year);
+
+-- 修复动作台账：生态修复的每次执行都独立留痕，供修复成效归因。
+CREATE TABLE IF NOT EXISTS restoration_actions (
+  id TEXT PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  season TEXT NOT NULL,
+  day INTEGER NOT NULL,
+  site_id TEXT NOT NULL,
+  species_id TEXT,
+  action TEXT NOT NULL,
+  disturbance_before REAL NOT NULL,
+  disturbance_after REAL NOT NULL,
+  health_before REAL,
+  health_after REAL,
+  seed_bank_before REAL,
+  seed_bank_after REAL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_restoration_save_year
+  ON restoration_actions(save_id, year);
+
+-- 历史补算报告：与正式 annual_reports 物理隔离。
+-- 只允许补算 save.year 之前的年份；补算过程不触碰任何状态表，
+-- 因此补算结果永远不会污染后续年份的正式报告。
+CREATE TABLE IF NOT EXISTS backfilled_annual_reports (
+  id TEXT PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  report_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(save_id, year)
+);
 `;
