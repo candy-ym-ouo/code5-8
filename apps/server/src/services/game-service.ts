@@ -14,11 +14,11 @@ import type {
 } from '@shanhai/contracts';
 import { SEASON_LABELS } from '@shanhai/contracts';
 import {
-  applyOverwinter,
   applySampleEffects,
+  buildAnnualReview,
+  buildInitialYearStates,
   CATALOG_VERSION,
-  createSpeciesState,
-  disperseSpecies,
+  deriveNextYearStates,
   evaluateSample,
   evolveSeason,
   generateSiteState,
@@ -31,6 +31,9 @@ import {
   SPECIES_BY_ID,
   SITES,
   SITES_BY_ID,
+  type AnnualReportInput,
+  type RestorationRecord,
+  type SamplingRecord,
   type SiteState,
   type SpeciesState
 } from '@shanhai/game-core';
@@ -329,12 +332,80 @@ export class GameService {
   getAnnualReport(sessionId: string, saveId: string, year: number): AnnualReview {
     this.getSaveOrThrow(saveId, sessionId);
     const row = this.store.db
-      .prepare('SELECT report_json FROM annual_reports WHERE save_id = ? AND year = ?')
-      .get(saveId, year) as unknown as { report_json: string } | undefined;
+      .prepare('SELECT report_json, created_at FROM annual_reports WHERE save_id = ? AND year = ?')
+      .get(saveId, year) as unknown as { report_json: string; created_at: string } | undefined;
     if (!row) {
       throw new AppError('REPORT_NOT_FOUND', '该年度报告尚未生成', 404);
     }
-    return parseJson<AnnualReview>(row.report_json, {} as AnnualReview);
+    return normalizeAnnualReview(parseJson<AnnualReview>(row.report_json, {} as AnnualReview), row.created_at);
+  }
+
+  /**
+   * Rebuilds a missing historical year's report from immutable records only.
+   * The backfill never touches the save cursor, species/site states, the event
+   * log or any other year's report, so later reports stay uncontaminated.
+   */
+  backfillAnnualReport(sessionId: string, saveId: string, year: number): AnnualReview {
+    return this.store.transaction(() => {
+      const save = this.getSaveOrThrow(saveId, sessionId);
+      if (!Number.isInteger(year) || year < 1 || year >= save.year) {
+        throw new AppError('BACKFILL_YEAR_INVALID', '只能补算已经完整结算的历史年份', 409);
+      }
+      const existing = this.store.db
+        .prepare('SELECT id FROM annual_reports WHERE save_id = ? AND year = ?')
+        .get(saveId, year);
+      if (existing) {
+        throw new AppError('REPORT_EXISTS', '该年度报告已存在，补算不会覆盖历史结论', 409);
+      }
+      const winterSummary = this.store.db
+        .prepare(`SELECT id FROM season_summaries WHERE save_id = ? AND year = ? AND season = 'winter'`)
+        .get(saveId, year);
+      const finalSpecies = this.getSpeciesStates(saveId, year);
+      const finalSites = this.getSiteStates(saveId, year);
+      if (!winterSummary || finalSpecies.length === 0 || finalSites.length === 0) {
+        throw new AppError('BACKFILL_SOURCE_MISSING', '该年份缺少完整的结算数据，无法补算', 409);
+      }
+
+      // 年初快照只从不可变来源重建：第 1 年由存档种子确定性重放，
+      // 更晚年份由上一年末的持久化状态经同一套越冬与扩散规则推导。
+      let yearStartSpecies: SpeciesState[];
+      let yearStartSites: SiteState[];
+      if (year === 1) {
+        const initial = buildInitialYearStates(save.id, save.seed);
+        yearStartSpecies = initial.species;
+        yearStartSites = initial.sites;
+      } else {
+        const previousSpecies = this.getSpeciesStates(saveId, year - 1);
+        const previousSites = this.getSiteStates(saveId, year - 1);
+        if (previousSpecies.length === 0 || previousSites.length === 0) {
+          throw new AppError('BACKFILL_SOURCE_MISSING', '上一年度状态缺失，无法重建该年的年初快照', 409);
+        }
+        const derived = deriveNextYearStates({
+          saveId: save.id,
+          seed: save.seed,
+          nextYear: year,
+          currentSpecies: previousSpecies,
+          currentSites: previousSites
+        });
+        yearStartSpecies = derived.species;
+        yearStartSites = derived.sites;
+      }
+
+      const report = buildAnnualReview(
+        this.gatherReportInput(save, {
+          year,
+          generatedBy: 'backfill',
+          yearStartSpecies,
+          yearStartSites,
+          finalSpecies,
+          finalSites
+        })
+      );
+      this.store.db
+        .prepare('INSERT INTO annual_reports (id, save_id, year, report_json, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(randomUUID(), saveId, year, JSON.stringify(report), new Date().toISOString());
+      return report;
+    });
   }
 
   executeCommand(
@@ -463,26 +534,16 @@ export class GameService {
   }
 
   private initializeYear(save: SaveRecord): void {
-    const speciesStates: SpeciesState[] = [];
-    const siteStates: SiteState[] = [];
-    for (const site of SITES) {
-      const siteState = generateSiteState(save.id, save.seed, save.year, save.season, save.day, site.id);
+    const initial = buildInitialYearStates(save.id, save.seed);
+    for (const siteState of initial.sites) {
       this.upsertSiteState(siteState);
       this.recordEnvironmentHistory(siteState, save.season, save.day);
-      siteStates.push(siteState);
-      for (const definition of SPECIES_BY_ID.values()) {
-        if (!definition.zones[site.id]) {
-          continue;
-        }
-        const state = createSpeciesState(save.id, save.seed, save.year, save.season, site.id, definition.id);
-        state.suitability = round(getSuitability(definition, siteState), 3);
-        state.status = getStatus(state.population, definition.zones[site.id]!.carryingCapacity, state.health);
-        this.upsertSpeciesState(state);
-        speciesStates.push(state);
-      }
     }
-    save.year_start_sites_json = JSON.stringify(siteStates);
-    save.year_start_species_json = JSON.stringify(speciesStates);
+    for (const state of initial.species) {
+      this.upsertSpeciesState(state);
+    }
+    save.year_start_sites_json = JSON.stringify(initial.sites);
+    save.year_start_species_json = JSON.stringify(initial.species);
   }
 
   private regenerateEnvironments(save: SaveRecord): void {
@@ -770,6 +831,7 @@ export class GameService {
     }
 
     const profile = definition.zones[save.current_site_id]!;
+    const before = { disturbance: site.disturbance, health: state.health, seedBank: state.seedBank };
     if (action === 'reduce_disturbance' || action === 'restore_wetland') {
       site.disturbance = Math.max(0, site.disturbance - (action === 'restore_wetland' ? 0.1 : 0.07));
       state.health = Math.min(100, state.health + 3);
@@ -784,6 +846,27 @@ export class GameService {
     state.status = getStatus(state.population, profile.carryingCapacity, state.health);
     this.upsertSiteState(site);
     this.upsertSpeciesState(state);
+    this.store.db
+      .prepare(
+        `INSERT INTO restoration_actions
+         (id, save_id, year, season, day, site_id, species_id, action, metrics_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        randomUUID(),
+        save.id,
+        save.year,
+        save.season,
+        save.day,
+        save.current_site_id,
+        speciesId,
+        action,
+        JSON.stringify({
+          before,
+          after: { disturbance: site.disturbance, health: state.health, seedBank: state.seedBank }
+        }),
+        new Date().toISOString()
+      );
     this.consumeAction(save, 2);
     return {
       event: {
@@ -852,51 +935,20 @@ export class GameService {
 
     const currentSpecies = this.getSpeciesStates(save.id, save.year);
     const currentSites = this.getSiteStates(save.id, save.year);
-    const siteMap = new Map(currentSites.map((site) => [site.siteId, site]));
     const nextYear = save.year + 1;
-    const nextSpecies: SpeciesState[] = [];
-    const nextSites: SiteState[] = [];
+    const derived = deriveNextYearStates({
+      saveId: save.id,
+      seed: save.seed,
+      nextYear,
+      currentSpecies,
+      currentSites
+    });
 
-    for (const site of SITES) {
-      const previous = siteMap.get(site.id);
-      const nextSite = generateSiteState(
-        save.id,
-        save.seed,
-        nextYear,
-        'spring',
-        1,
-        site.id,
-        Math.max(0.02, (previous?.disturbance ?? 0.08) * 0.92)
-      );
+    for (const nextSite of derived.sites) {
       this.upsertSiteState(nextSite);
       this.recordEnvironmentHistory(nextSite, 'spring', 1);
-      nextSites.push(nextSite);
     }
-    const nextSiteMap = new Map(nextSites.map((site) => [site.siteId, site]));
-
-    for (const state of currentSpecies) {
-      const site = siteMap.get(state.siteId);
-      const nextSite = nextSiteMap.get(state.siteId);
-      const definition = SPECIES_BY_ID.get(state.speciesId);
-      if (!site || !nextSite || !definition) {
-        continue;
-      }
-      const overwintered = applyOverwinter(state, site);
-      const nextState: SpeciesState = {
-        ...overwintered,
-        year: nextYear,
-        suitability: round(getSuitability(definition, nextSite), 3)
-      };
-      nextState.status = getStatus(
-        nextState.population,
-        definition.zones[state.siteId]!.carryingCapacity,
-        nextState.health
-      );
-      nextSpecies.push(nextState);
-    }
-
-    const dispersedSpecies = disperseSpecies(nextSpecies, nextSites);
-    for (const state of dispersedSpecies) {
+    for (const state of derived.species) {
       this.upsertSpeciesState(state);
     }
 
@@ -906,8 +958,8 @@ export class GameService {
     save.slot = 1;
     save.action_points = 30;
     save.phase = 'active';
-    save.year_start_species_json = JSON.stringify(dispersedSpecies);
-    save.year_start_sites_json = JSON.stringify(nextSites);
+    save.year_start_species_json = JSON.stringify(derived.species);
+    save.year_start_sites_json = JSON.stringify(derived.sites);
     return {
       event: {
         type: 'BEGIN_NEXT_YEAR',
@@ -992,18 +1044,13 @@ export class GameService {
 
     if (save.season === 'winter') {
       const report = this.createAnnualReport(save, finalStates);
-      const shouldUnlock =
-        report.populationChangePercent < -2 ||
-        report.incorrectSamples > 0 ||
-        report.speciesChanges.some((change) => change.status === 'vulnerable' || change.status === 'endangered');
-      report.restorationUnlocked = shouldUnlock;
       this.store.db
         .prepare(
           `INSERT OR REPLACE INTO annual_reports (id, save_id, year, report_json, created_at)
            VALUES (?, ?, ?, ?, ?)`
         )
         .run(randomUUID(), save.id, save.year, JSON.stringify(report), new Date().toISOString());
-      save.restoration_unlocked = save.restoration_unlocked || (shouldUnlock ? 1 : 0);
+      save.restoration_unlocked = save.restoration_unlocked || (report.restorationUnlocked ? 1 : 0);
       save.phase = 'year_review';
     } else {
       save.phase = 'season_review';
@@ -1012,105 +1059,118 @@ export class GameService {
   }
 
   private createAnnualReport(save: SaveRecord, finalStates: SpeciesState[]): AnnualReview {
-    const initialStates = parseJson<SpeciesState[]>(save.year_start_species_json, []);
-    const initialByKey = new Map(initialStates.map((state) => [stateKey(state), state]));
-    const finalByKey = new Map(finalStates.map((state) => [stateKey(state), state]));
-    const keys = new Set([...initialByKey.keys(), ...finalByKey.keys()]);
+    return buildAnnualReview(
+      this.gatherReportInput(save, {
+        year: save.year,
+        generatedBy: 'settlement',
+        yearStartSpecies: parseJson<SpeciesState[]>(save.year_start_species_json, []),
+        yearStartSites: parseJson<SiteState[]>(save.year_start_sites_json, []),
+        finalSpecies: finalStates,
+        finalSites: this.getSiteStates(save.id, save.year)
+      })
+    );
+  }
 
-    const speciesAggregate = new Map<
-      string,
-      { startPopulation: number; finalPopulation: number; startHealth: number; finalHealth: number; count: number; status: string }
-    >();
-    const distributionChanges: string[] = [];
-
-    for (const key of keys) {
-      const initial = initialByKey.get(key);
-      const final = finalByKey.get(key);
-      const state = final ?? initial;
-      if (!state) {
-        continue;
-      }
-      const aggregate = speciesAggregate.get(state.speciesId) ?? {
-        startPopulation: 0,
-        finalPopulation: 0,
-        startHealth: 0,
-        finalHealth: 0,
-        count: 0,
-        status: 'stable'
-      };
-      aggregate.startPopulation += initial?.population ?? 0;
-      aggregate.finalPopulation += final?.population ?? 0;
-      aggregate.startHealth += initial?.health ?? 0;
-      aggregate.finalHealth += final?.health ?? 0;
-      aggregate.count += 1;
-      aggregate.status = worstStatus(aggregate.status, final?.status ?? initial?.status ?? 'stable');
-      speciesAggregate.set(state.speciesId, aggregate);
-
-      if (initial && final && initial.status !== final.status) {
-        distributionChanges.push(
-          `${SITES_BY_ID.get(state.siteId)?.name ?? state.siteId}：${SPECIES_BY_ID.get(state.speciesId)?.name ?? state.speciesId} 由 ${statusLabel(initial.status)} 变为 ${statusLabel(final.status)}`
-        );
-      }
+  /**
+   * Collects the immutable evidence a yearly report is built from. Used by the
+   * winter settlement and by historical backfill, so both reach the same
+   * conclusions from the same records.
+   */
+  private gatherReportInput(
+    save: SaveRecord,
+    basis: {
+      year: number;
+      generatedBy: 'settlement' | 'backfill';
+      yearStartSpecies: SpeciesState[];
+      yearStartSites: SiteState[];
+      finalSpecies: SpeciesState[];
+      finalSites: SiteState[];
     }
+  ): AnnualReportInput {
+    const sampleRows = this.store.db
+      .prepare(
+        `SELECT id, site_id, species_id, method, season, day, protocol_match, effects_json
+         FROM samples WHERE save_id = ? AND year = ? ORDER BY created_at ASC`
+      )
+      .all(save.id, basis.year) as unknown as Array<Record<string, unknown>>;
+    const incorrectRecords: SamplingRecord[] = sampleRows
+      .filter((row) => Number(row.protocol_match) === 0)
+      .map((row) => {
+        const effects = parseJson<{ health?: number; populationDelta?: number; seedBankDelta?: number }>(
+          String(row.effects_json),
+          {}
+        );
+        return {
+          id: String(row.id),
+          siteId: String(row.site_id) as SiteId,
+          speciesId: String(row.species_id),
+          method: String(row.method) as SampleMethod,
+          season: String(row.season) as Season,
+          day: Number(row.day),
+          effects: {
+            health: Number(effects.health ?? 0),
+            populationDelta: Number(effects.populationDelta ?? 0),
+            seedBankDelta: Number(effects.seedBankDelta ?? 0)
+          }
+        };
+      });
 
-    let totalStart = 0;
-    let totalFinal = 0;
-    const speciesChanges = [...speciesAggregate.entries()].map(([speciesId, aggregate]) => {
-      totalStart += aggregate.startPopulation;
-      totalFinal += aggregate.finalPopulation;
+    const restorationRows = this.store.db
+      .prepare(
+        `SELECT id, site_id, species_id, action, season, day, metrics_json
+         FROM restoration_actions WHERE save_id = ? AND year = ? ORDER BY created_at ASC`
+      )
+      .all(save.id, basis.year) as unknown as Array<Record<string, unknown>>;
+    const restoration: RestorationRecord[] = restorationRows.map((row) => {
+      const metrics = parseJson<{
+        before?: { disturbance?: number; health?: number; seedBank?: number };
+        after?: { disturbance?: number; health?: number; seedBank?: number };
+      }>(String(row.metrics_json), {});
       return {
-        speciesId,
-        name: SPECIES_BY_ID.get(speciesId)?.name ?? speciesId,
-        populationChangePercent: percentChange(aggregate.startPopulation, aggregate.finalPopulation),
-        healthChange: round(
-          aggregate.finalHealth / Math.max(1, aggregate.count) - aggregate.startHealth / Math.max(1, aggregate.count),
-          1
-        ),
-        status: aggregate.status
+        id: String(row.id),
+        siteId: String(row.site_id) as SiteId,
+        speciesId: String(row.species_id),
+        action: String(row.action),
+        season: String(row.season) as Season,
+        day: Number(row.day),
+        before: {
+          disturbance: Number(metrics.before?.disturbance ?? 0),
+          health: Number(metrics.before?.health ?? 0),
+          seedBank: Number(metrics.before?.seedBank ?? 0)
+        },
+        after: {
+          disturbance: Number(metrics.after?.disturbance ?? 0),
+          health: Number(metrics.after?.health ?? 0),
+          seedBank: Number(metrics.after?.seedBank ?? 0)
+        }
       };
     });
-    speciesChanges.sort((left, right) => left.populationChangePercent - right.populationChangePercent);
 
-    const incorrectSamples = Number(
-      (
-        this.store.db
-          .prepare('SELECT COUNT(*) AS count FROM samples WHERE save_id = ? AND year = ? AND protocol_match = 0')
-          .get(save.id, save.year) as unknown as { count: number }
-      ).count
-    );
-
-    const recommendations: string[] = [];
-    if (incorrectSamples > 0) {
-      recommendations.push('下一年优先使用拍照和条件合适的非破坏性采集，避免在错误物候期重复取样。');
+    const observationRows = this.store.db
+      .prepare(`SELECT feedback_json FROM observations WHERE save_id = ? AND year = ? AND kind = 'plant'`)
+      .all(save.id, basis.year) as unknown as Array<{ feedback_json: string }>;
+    let stageMatched = 0;
+    for (const row of observationRows) {
+      if (parseJson<{ stageMatched?: boolean }>(row.feedback_json, {}).stageMatched) {
+        stageMatched += 1;
+      }
     }
-    const declining = speciesChanges.filter((item) => item.populationChangePercent < -2);
-    if (declining.length > 0) {
-      recommendations.push(`重点关注 ${declining.slice(0, 3).map((item) => item.name).join('、')}，并在衰退区域设置观察样方。`);
-    }
-    if (distributionChanges.some((item) => item.includes('濒危'))) {
-      recommendations.push('对濒危区域停止剪取，优先执行降低干扰和保留种子区。');
-    }
-    if (recommendations.length < 2) {
-      recommendations.push('保持固定样方和连续物候记录，以提高下一年度花期预报置信度。');
-    }
-
-    const populationChangePercent = percentChange(totalStart, totalFinal);
-    const headline =
-      populationChangePercent < -5
-        ? '今年的人为干扰和气候压力已改变物种分布'
-        : populationChangePercent < 1
-          ? '生态系统总体稳定，但局部种群正在调整'
-          : '适宜生境中的种群实现增长，分布正在恢复';
 
     return {
-      year: save.year,
-      headline,
-      populationChangePercent,
-      speciesChanges,
-      distributionChanges: distributionChanges.length > 0 ? distributionChanges : ['本年度未发生跨等级分布状态变化。'],
-      incorrectSamples,
-      recommendations,
-      restorationUnlocked: false
+      year: basis.year,
+      generatedBy: basis.generatedBy,
+      generatedAt: new Date().toISOString(),
+      yearStartSpecies: basis.yearStartSpecies,
+      yearStartSites: basis.yearStartSites,
+      finalSpecies: basis.finalSpecies,
+      finalSites: basis.finalSites,
+      sampling: {
+        total: sampleRows.length,
+        incorrect: incorrectRecords.length,
+        incorrectRecords
+      },
+      restoration,
+      phenologyObservations: { total: observationRows.length, stageMatched }
     };
   }
 
@@ -1191,8 +1251,8 @@ export class GameService {
       .prepare('SELECT summary_json FROM season_summaries WHERE save_id = ? AND year = ? AND season = ?')
       .get(save.id, save.year, save.season) as unknown as { summary_json: string } | undefined;
     const reportRow = this.store.db
-      .prepare('SELECT report_json FROM annual_reports WHERE save_id = ? AND year = ?')
-      .get(save.id, save.year) as unknown as { report_json: string } | undefined;
+      .prepare('SELECT report_json, created_at FROM annual_reports WHERE save_id = ? AND year = ?')
+      .get(save.id, save.year) as unknown as { report_json: string; created_at: string } | undefined;
 
     return {
       saveId: save.id,
@@ -1209,7 +1269,9 @@ export class GameService {
       sites,
       recentEvents,
       seasonReview: seasonSummaryRow ? parseJson<SeasonReview>(seasonSummaryRow.summary_json, null as unknown as SeasonReview) : null,
-      annualReview: reportRow ? parseJson<AnnualReview>(reportRow.report_json, null as unknown as AnnualReview) : null
+      annualReview: reportRow
+        ? normalizeAnnualReview(parseJson<AnnualReview>(reportRow.report_json, null as unknown as AnnualReview), reportRow.created_at)
+        : null
     };
   }
 
@@ -1556,11 +1618,19 @@ function stateKey(state: SpeciesState): string {
   return `${state.siteId}:${state.speciesId}`;
 }
 
-function percentChange(start: number, end: number): number {
-  if (start <= 0) {
-    return end > 0 ? 100 : 0;
-  }
-  return round(((end - start) / start) * 100, 1);
+function normalizeAnnualReview(report: AnnualReview, createdAt?: string): AnnualReview {
+  const recommendations = Array.isArray(report.recommendations) ? report.recommendations : [];
+  return {
+    ...report,
+    distributionChanges: Array.isArray(report.distributionChanges) ? report.distributionChanges : [],
+    recommendations,
+    findings: Array.isArray(report.findings) ? report.findings : [],
+    recommendationItems: Array.isArray(report.recommendationItems)
+      ? report.recommendationItems
+      : recommendations.map((text) => ({ text, findingIds: [] })),
+    generatedAt: typeof report.generatedAt === 'string' && report.generatedAt ? report.generatedAt : (createdAt ?? ''),
+    generatedBy: report.generatedBy === 'backfill' ? 'backfill' : 'settlement'
+  };
 }
 
 function formatSigned(value: number): string {
@@ -1569,28 +1639,6 @@ function formatSigned(value: number): string {
 
 function stringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
-}
-
-function statusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    growing: '增长',
-    stable: '稳定',
-    vulnerable: '脆弱',
-    endangered: '濒危',
-    absent: '局部消失'
-  };
-  return labels[status] ?? status;
-}
-
-function worstStatus(left: string, right: string): string {
-  const severity: Record<string, number> = {
-    growing: 0,
-    stable: 1,
-    vulnerable: 2,
-    endangered: 3,
-    absent: 4
-  };
-  return (severity[right] ?? 1) > (severity[left] ?? 1) ? right : left;
 }
 
 export { CATALOG_VERSION };

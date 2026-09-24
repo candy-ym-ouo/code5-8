@@ -157,6 +157,11 @@ export function createApp(options: CreateAppOptions = {}) {
     res.json(service.getAnnualReport(res.locals.sessionId as string, parameter(req, 'saveId'), year));
   });
 
+  app.post('/api/save/:saveId/report/:year/backfill', requireSession, (req, res) => {
+    const year = z.coerce.number().int().positive().parse(parameter(req, 'year'));
+    res.json(service.backfillAnnualReport(res.locals.sessionId as string, parameter(req, 'saveId'), year));
+  });
+
   app.get('/api/save/:saveId/events', requireSession, (req, res) => {
     const world = service.getWorld(res.locals.sessionId as string, parameter(req, 'saveId'));
     res.json({ events: world.recentEvents });

@@ -110,6 +110,21 @@ describe('closed-loop API', () => {
     expect(world.annualReview?.speciesChanges.every((item) => Number.isFinite(item.populationChangePercent))).toBe(true);
     expect(world.annualReview?.speciesChanges.every((item) => Number.isFinite(item.healthChange))).toBe(true);
 
+    const findings = world.annualReview?.findings ?? [];
+    expect(new Set(findings.map((finding) => finding.category))).toEqual(
+      new Set(['distribution', 'phenology', 'restoration', 'sampling'])
+    );
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.every((finding) => finding.evidence.length > 0)).toBe(true);
+    expect(findings.some((finding) => finding.category === 'sampling' && finding.severity === 'warning')).toBe(true);
+    expect(world.annualReview?.generatedBy).toBe('settlement');
+    const findingIds = new Set(findings.map((finding) => finding.id));
+    const recommendationItems = world.annualReview?.recommendationItems ?? [];
+    expect(recommendationItems.length).toBeGreaterThan(0);
+    expect(
+      recommendationItems.every((item) => item.findingIds.every((id) => findingIds.has(id)))
+    ).toBe(true);
+
     world = await command(agent, world, { type: 'BEGIN_NEXT_YEAR' });
     expect(world.year).toBe(2);
     expect(world.season).toBe('spring');
@@ -134,6 +149,116 @@ describe('closed-loop API', () => {
     expect(imported.body.year).toBe(2);
     expect(store.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
   }, 30_000);
+
+  it('backfills a missing historical report without contaminating later years', async () => {
+    const backfillAgent = request.agent(app);
+    const createResponse = await backfillAgent.post('/api/save').expect(201);
+    let world = createResponse.body as WorldSnapshot;
+
+    world = await command(backfillAgent, world, {
+      type: 'TAKE_SAMPLE',
+      speciesId: 'prunus-davidiana',
+      method: 'litter'
+    });
+    for (const season of ['spring', 'summer', 'autumn', 'winter'] as Season[]) {
+      world = await advanceToDayEight(backfillAgent, world);
+      world = await command(backfillAgent, world, { type: 'END_SEASON' });
+      if (season !== 'winter') {
+        world = await command(backfillAgent, world, { type: 'BEGIN_NEXT_SEASON' });
+      }
+    }
+    expect(world.phase).toBe('year_review');
+    const originalReport = world.annualReview!;
+    expect(originalReport.generatedBy).toBe('settlement');
+
+    world = await command(backfillAgent, world, { type: 'BEGIN_NEXT_YEAR' });
+    expect(world.year).toBe(2);
+
+    // 模拟历史报告缺失，并记录补算前的存档与日志状态。
+    store.db.prepare('DELETE FROM annual_reports WHERE save_id = ? AND year = 1').run(world.saveId);
+    const saveBefore = store.db.prepare('SELECT * FROM saves WHERE id = ?').get(world.saveId) as Record<string, unknown>;
+    const countRows = (sql: string) =>
+      Number((store.db.prepare(sql).get(world.saveId) as unknown as { count: number }).count);
+    const countsBefore = {
+      events: countRows('SELECT COUNT(*) AS count FROM game_events WHERE save_id = ?'),
+      speciesStates: countRows('SELECT COUNT(*) AS count FROM species_states WHERE save_id = ?'),
+      siteStates: countRows('SELECT COUNT(*) AS count FROM site_states WHERE save_id = ?'),
+      seasonSummaries: countRows('SELECT COUNT(*) AS count FROM season_summaries WHERE save_id = ?'),
+      receipts: countRows('SELECT COUNT(*) AS count FROM command_receipts WHERE save_id = ?')
+    };
+
+    await backfillAgent.get(`/api/save/${world.saveId}/report/1`).expect(404);
+    const backfillResponse = await backfillAgent.post(`/api/save/${world.saveId}/report/1/backfill`).expect(200);
+    const backfilled = backfillResponse.body as typeof originalReport;
+    expect(backfilled.year).toBe(1);
+    expect(backfilled.generatedBy).toBe('backfill');
+
+    // 补算结论必须与当年结算结论完全一致（生成方式与时间戳除外）。
+    const { generatedAt: _originalAt, generatedBy: _originalBy, ...originalConclusions } = originalReport;
+    const { generatedAt: _backfillAt, generatedBy: _backfillBy, ...backfilledConclusions } = backfilled;
+    expect(backfilledConclusions).toEqual(originalConclusions);
+
+    // 补算不得污染存档进度、事件流、状态表与其他年份数据。
+    const saveAfter = store.db.prepare('SELECT * FROM saves WHERE id = ?').get(world.saveId) as Record<string, unknown>;
+    expect(saveAfter.revision).toBe(saveBefore.revision);
+    expect(saveAfter.year).toBe(saveBefore.year);
+    expect(saveAfter.season).toBe(saveBefore.season);
+    expect(saveAfter.phase).toBe(saveBefore.phase);
+    expect(saveAfter.restoration_unlocked).toBe(saveBefore.restoration_unlocked);
+    expect(countRows('SELECT COUNT(*) AS count FROM game_events WHERE save_id = ?')).toBe(countsBefore.events);
+    expect(countRows('SELECT COUNT(*) AS count FROM species_states WHERE save_id = ?')).toBe(countsBefore.speciesStates);
+    expect(countRows('SELECT COUNT(*) AS count FROM site_states WHERE save_id = ?')).toBe(countsBefore.siteStates);
+    expect(countRows('SELECT COUNT(*) AS count FROM season_summaries WHERE save_id = ?')).toBe(countsBefore.seasonSummaries);
+    expect(countRows('SELECT COUNT(*) AS count FROM command_receipts WHERE save_id = ?')).toBe(countsBefore.receipts);
+
+    // 已存在的报告不得被补算覆盖；当前或未来年份不可补算。
+    await backfillAgent.post(`/api/save/${world.saveId}/report/1/backfill`).expect(409);
+    await backfillAgent.post(`/api/save/${world.saveId}/report/2/backfill`).expect(409);
+    await backfillAgent.post(`/api/save/${world.saveId}/report/9/backfill`).expect(409);
+
+    const persisted = await backfillAgent.get(`/api/save/${world.saveId}/report/1`).expect(200);
+    expect(persisted.body.generatedBy).toBe('backfill');
+    const yearOneReportRow = store.db
+      .prepare('SELECT report_json FROM annual_reports WHERE save_id = ? AND year = 1')
+      .get(world.saveId) as unknown as { report_json: string };
+
+    // 后续年份照常结算，其报告不受补算影响，补算报告也不被改写。
+    for (const season of ['spring', 'summer', 'autumn', 'winter'] as Season[]) {
+      world = await advanceToDayEight(backfillAgent, world);
+      world = await command(backfillAgent, world, { type: 'END_SEASON' });
+      if (season !== 'winter') {
+        world = await command(backfillAgent, world, { type: 'BEGIN_NEXT_SEASON' });
+      }
+    }
+    expect(world.phase).toBe('year_review');
+    expect(world.annualReview?.year).toBe(2);
+    expect(world.annualReview?.generatedBy).toBe('settlement');
+    expect(world.annualReview?.findings.length).toBeGreaterThan(0);
+
+    const yearOneReportRowAfter = store.db
+      .prepare('SELECT report_json FROM annual_reports WHERE save_id = ? AND year = 1')
+      .get(world.saveId) as unknown as { report_json: string };
+    expect(yearOneReportRowAfter.report_json).toBe(yearOneReportRow.report_json);
+
+    const yearTwo = await backfillAgent.get(`/api/save/${world.saveId}/report/2`).expect(200);
+    expect(yearTwo.body.generatedBy).toBe('settlement');
+
+    // 第 2 年报告的补算走“上一年末状态 → 越冬/扩散推导”的重建路径，
+    // 结论同样必须与当年结算完全一致。
+    const yearTwoReport = world.annualReview!;
+    world = await command(backfillAgent, world, { type: 'BEGIN_NEXT_YEAR' });
+    expect(world.year).toBe(3);
+    const revisionBeforeYearTwoBackfill = world.revision;
+    store.db.prepare('DELETE FROM annual_reports WHERE save_id = ? AND year = 2').run(world.saveId);
+    const yearTwoBackfill = await backfillAgent.post(`/api/save/${world.saveId}/report/2/backfill`).expect(200);
+    expect(yearTwoBackfill.body.generatedBy).toBe('backfill');
+    const { generatedAt: _y2At, generatedBy: _y2By, ...yearTwoConclusions } = yearTwoReport;
+    const { generatedAt: _y2bAt, generatedBy: _y2bBy, ...yearTwoBackfilled } = yearTwoBackfill.body as typeof yearTwoReport;
+    expect(yearTwoBackfilled).toEqual(yearTwoConclusions);
+    const worldAfter = await backfillAgent.get(`/api/save/${world.saveId}/world`).expect(200);
+    expect(worldAfter.body.year).toBe(3);
+    expect(worldAfter.body.revision).toBe(revisionBeforeYearTwoBackfill);
+  }, 60_000);
 });
 
 async function command(

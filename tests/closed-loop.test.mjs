@@ -77,6 +77,12 @@ try {
   assert.equal(world.phase, 'year_review');
   assert.equal(world.annualReview.year, 1);
   assert.ok(world.annualReview.incorrectSamples > 0);
+  assert.equal(world.annualReview.generatedBy, 'settlement');
+  assert.deepEqual(
+    new Set(world.annualReview.findings.map((finding) => finding.category)),
+    new Set(['distribution', 'phenology', 'restoration', 'sampling'])
+  );
+  assert.ok(world.annualReview.findings.every((finding) => finding.evidence.length > 0));
   await send({ type: 'BEGIN_NEXT_YEAR' });
   assert.equal(world.year, 2);
   assert.equal(world.season, 'spring');
@@ -84,7 +90,19 @@ try {
 
   const report = await api(`/api/save/${world.saveId}/report/1`);
   assert.equal(report.year, 1);
-  console.log('Closed-loop E2E passed: create -> observe -> wrong sample -> four seasons -> report -> year 2');
+  assert.ok(report.findings.some((finding) => finding.category === 'sampling' && finding.severity === 'warning'));
+
+  const duplicateBackfill = await fetch(`${baseUrl}/api/save/${world.saveId}/report/1/backfill`, {
+    method: 'POST',
+    headers: { cookie }
+  });
+  assert.equal(duplicateBackfill.status, 409);
+  const futureBackfill = await fetch(`${baseUrl}/api/save/${world.saveId}/report/2/backfill`, {
+    method: 'POST',
+    headers: { cookie }
+  });
+  assert.equal(futureBackfill.status, 409);
+  console.log('Closed-loop E2E passed: create -> observe -> wrong sample -> four seasons -> traceable report -> year 2');
 
   async function waitForServer() {
     const deadline = Date.now() + 15_000;

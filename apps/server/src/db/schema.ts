@@ -138,6 +138,22 @@ CREATE TABLE IF NOT EXISTS annual_reports (
   UNIQUE(save_id, year)
 );
 
+CREATE TABLE IF NOT EXISTS restoration_actions (
+  id TEXT PRIMARY KEY,
+  save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,
+  year INTEGER NOT NULL,
+  season TEXT NOT NULL,
+  day INTEGER NOT NULL,
+  site_id TEXT NOT NULL,
+  species_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  metrics_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_restoration_actions_save_year
+  ON restoration_actions(save_id, year);
+
 CREATE TABLE IF NOT EXISTS game_events (
   id TEXT PRIMARY KEY,
   save_id TEXT NOT NULL REFERENCES saves(id) ON DELETE CASCADE,

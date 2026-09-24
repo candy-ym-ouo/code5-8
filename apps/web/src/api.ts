@@ -100,6 +100,10 @@ export const api = {
     }>(`/api/save/${saveId}/species/${speciesId}`),
   getReport: (saveId: string, year: number) =>
     request<AnnualReview>(`/api/save/${saveId}/report/${year}`),
+  backfillReport: (saveId: string, year: number) =>
+    request<AnnualReview>(`/api/save/${saveId}/report/${year}/backfill`, {
+      method: 'POST'
+    }),
   exportSave: (saveId: string) =>
     request<{ token: string; expiresAt: string }>(`/api/save/${saveId}/export`, {
       method: 'POST'

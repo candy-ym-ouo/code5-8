@@ -164,6 +164,32 @@ export interface SeasonReview {
   changes: string[];
 }
 
+export const REPORT_FINDING_CATEGORIES = ['distribution', 'phenology', 'restoration', 'sampling'] as const;
+export type ReportFindingCategory = (typeof REPORT_FINDING_CATEGORIES)[number];
+
+export const REPORT_FINDING_SEVERITIES = ['info', 'notice', 'warning', 'critical'] as const;
+export type ReportFindingSeverity = (typeof REPORT_FINDING_SEVERITIES)[number];
+
+export interface ReportEvidence {
+  label: string;
+  value: string;
+  source: string;
+}
+
+export interface ReportFinding {
+  id: string;
+  category: ReportFindingCategory;
+  severity: ReportFindingSeverity;
+  title: string;
+  detail: string;
+  evidence: ReportEvidence[];
+}
+
+export interface AnnualRecommendation {
+  text: string;
+  findingIds: string[];
+}
+
 export interface AnnualReview {
   year: number;
   headline: string;
@@ -179,6 +205,10 @@ export interface AnnualReview {
   incorrectSamples: number;
   recommendations: string[];
   restorationUnlocked: boolean;
+  findings: ReportFinding[];
+  recommendationItems: AnnualRecommendation[];
+  generatedAt: string;
+  generatedBy: 'settlement' | 'backfill';
 }
 
 export interface WorldSnapshot {
